@@ -1,0 +1,321 @@
+------------------package.json------------------
+{
+    "name": "mcp-stytch-add",
+    "type": "module",
+    "scripts": {
+        "dev": "wrangler dev --env dev",
+        "deploy": "wrangler publish"
+    },
+    "dependencies": {
+        "chalk": "^4.1.2",
+        "dotenv": "^17.2.1",
+        "hono": "^3.12.12",
+        "node-fetch": "^3.3.2",
+        "stytch": "^11.8.0"
+    },
+    "devDependencies": {
+        "@cloudflare/workers-types": "^4.20250806.0",
+        "@types/node": "^24.2.0",
+        "typescript": "^5.9.2",
+        "wrangler": "^3.114.12"
+    }
+}
+
+
+---------------wrangler.toml-----------------
+name = "mcp-stytch-add"
+main = "src/index.ts"
+compatibility_date = "2024-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+STYTCH_PROJECT_ID = "project-test-91e90d73-b77d-4b26-a8c6-ce00a0ad2573"
+STYTCH_SECRET = "secret-test-DymkfmO0Mv9YFmPxMFfi6m01-izZfhYaw_0="
+
+-------------ts.config.json---------------
+{
+    "compilerOptions": {
+      "target": "ES2022",
+      "module": "ES2022",
+      "lib": ["ES2022"],
+      "outDir": "./dist",
+      "rootDir": "./src",
+      "moduleResolution": "node",
+      "allowSyntheticDefaultImports": true,
+      "esModuleInterop": true,
+      "skipLibCheck": true,
+      "strict": true,
+      "types": ["@cloudflare/workers-types"]
+    },
+    "include": ["src/**/*"],
+    "exclude": ["node_modules", "dist"]
+  }
+  
+  -----------src/auth.ts---------------------
+  import { MiddlewareHandler } from "hono";
+import { Env } from "./types";
+
+export const stytchAuthMiddleware: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
+  const authHeader = c.req.header("Authorization");
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return c.json({ 
+      jsonrpc: "2.0",
+      error: { 
+        code: -32600, 
+        message: "Invalid Request", 
+        data: "Missing or invalid Authorization header" 
+      } 
+    }, 401);
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const response = await fetch("https://test.stytch.com/v1/sessions/authenticate", {
+      method: "POST",
+      headers: {
+        Authorization: "Basic " + btoa(`${c.env.STYTCH_PROJECT_ID}:${c.env.STYTCH_SECRET}`),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ session_jwt: token }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      return c.json({ 
+        jsonrpc: "2.0",
+        error: { 
+          code: -32600, 
+          message: "Invalid Request", 
+          data: "Invalid or expired session token" 
+        } 
+      }, 401);
+    }
+
+    const result = await response.json();
+    c.set("user", result.session?.user_id);
+    await next();
+  } catch (error) {
+    return c.json({ 
+      jsonrpc: "2.0",
+      error: { 
+        code: -32603, 
+        message: "Internal error", 
+        data: "Authentication service error" 
+      } 
+    }, 500);
+  }
+};
+
+
+-----------------src/mcp.ts----------------------------
+// src/mcp.ts
+import { Context } from "hono";
+import { JsonRpcRequest, JsonRpcResponse, Env } from "./types";
+import { addTool, executeAddTool } from "./tools/addTool";
+
+const TOOLS = [addTool];
+
+const createJsonRpcResponse = (result: any, id?: string | number | null): JsonRpcResponse => ({
+  jsonrpc: "2.0",
+  result,
+  id
+});
+
+const createJsonRpcError = (code: number, message: string, id?: string | number | null, data?: any): JsonRpcResponse => ({
+  jsonrpc: "2.0",
+  error: { code, message, data },
+  id
+});
+
+export const mcpHandler = async (c: Context<{ Bindings: Env }>) => {
+  try {
+    const body: JsonRpcRequest = await c.req.json();
+
+    // Validate JSON-RPC format
+    if (body.jsonrpc !== "2.0" || !body.method) {
+      return c.json(createJsonRpcError(-32600, "Invalid Request", body.id), 400);
+    }
+
+    const { method, params, id } = body;
+
+    switch (method) {
+      case "initialize":
+        return c.json(createJsonRpcResponse({
+          protocolVersion: "2024-11-05",
+          capabilities: {
+            tools: {}
+          },
+          serverInfo: {
+            name: "mcp-stytch-add",
+            version: "1.0.0"
+          }
+        }, id));
+
+      case "tools/list":
+        return c.json(createJsonRpcResponse({
+          tools: TOOLS
+        }, id));
+
+      case "tools/call":
+        if (!params?.name) {
+          return c.json(createJsonRpcError(-32602, "Invalid params", id, "Tool name is required"), 400);
+        }
+
+        if (params.name === "addTwoNumbers") {
+          try {
+            const result = executeAddTool(params.arguments);
+            return c.json(createJsonRpcResponse({
+              content: [
+                {
+                  type: "text",
+                  text: `The sum of ${params.arguments.a} and ${params.arguments.b} is ${result}`
+                }
+              ]
+            }, id));
+          } catch (error) {
+            return c.json(createJsonRpcError(-32603, "Internal error", id, error.message), 500);
+          }
+        } else {
+          return c.json(createJsonRpcError(-32601, "Method not found", id, `Tool '${params.name}' not found`), 404);
+        }
+
+      default:
+        return c.json(createJsonRpcError(-32601, "Method not found", id), 404);
+    }
+  } catch (error) {
+    return c.json(createJsonRpcError(-32700, "Parse error", null, "Invalid JSON"), 400);
+  }
+};
+
+
+--------------------src/index.ts--------------------------
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import type { Context } from 'hono';
+import { mcpHandler } from './mcp';
+import { stytchAuthMiddleware } from './auth';
+import { Env } from './types';
+
+const app = new Hono<{ Bindings: Env }>();
+
+// Enable CORS
+app.use('*', cors({
+  origin: '*',
+  allowMethods: ['GET', 'POST', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+}));
+
+// Apply Stytch authentication middleware to /mcp route
+app.post('/mcp', stytchAuthMiddleware, mcpHandler);
+
+// Health check endpoint (no auth required)
+app.get('/health', (c) => {
+  return c.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// SSE handler (with auth)
+const handleSSE = async (c: Context<{ Bindings: Env }>) => {
+  const userId = c.get("user");
+  
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(`data: {"type": "connected", "userId": "${userId}"}\n\n`);
+      
+      const interval = setInterval(() => {
+        controller.enqueue(`data: {"type": "heartbeat", "timestamp": "${new Date().toISOString()}"}\n\n`);
+      }, 5000);
+
+      // Clean up after 30 seconds
+      setTimeout(() => {
+        clearInterval(interval);
+        controller.enqueue(`data: {"type": "disconnect"}\n\n`);
+        controller.close();
+      }, 30000);
+    }
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+};
+
+app.get('/mcp/sse', stytchAuthMiddleware, handleSSE);
+
+export default app;
+
+----------------src/types.ts----------------------
+
+export interface Env {
+    STYTCH_PROJECT_ID: string;
+    STYTCH_SECRET: string;
+    STYTCH_SESSION_TOKEN: string;
+  }
+  
+  export interface JsonRpcRequest {
+    jsonrpc: "2.0";
+    method: string;
+    params?: any;
+    id?: string | number | null;
+  }
+  
+  export interface JsonRpcResponse {
+    jsonrpc: "2.0";
+    result?: any;
+    error?: {
+      code: number;
+      message: string;
+      data?: any;
+    };
+    id?: string | number | null;
+  }
+  
+  export interface MCPTool {
+    name: string;
+    description: string;
+    inputSchema: {
+      type: "object";
+      properties: Record<string, any>;
+      required?: string[];
+    };
+  }
+  
+
+--------------------------src/tools/addTool.ts-------------------
+
+import { MCPTool } from "../types";
+
+export const addTool: MCPTool = {
+  name: "addTwoNumbers",
+  description: "Add two numbers together",
+  inputSchema: {
+    type: "object",
+    properties: {
+      a: {
+        type: "number",
+        description: "First number to add"
+      },
+      b: {
+        type: "number",
+        description: "Second number to add"
+      }
+    },
+    required: ["a", "b"]
+  }
+};
+
+export const executeAddTool = (params: { a: number; b: number }): number => {
+  if (typeof params.a !== 'number' || typeof params.b !== 'number') {
+    throw new Error("Both parameters must be numbers");
+  }
+  return params.a + params.b;
+};
+
+
+

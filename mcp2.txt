@@ -1,0 +1,717 @@
+----------------------package.json-------------
+
+{
+    "name": "mcp-ai-agent",
+    "version": "1.0.0",
+    "description": "AI Agent for MCP Server Integration",
+    "main": "dist/index.js",
+    "scripts": {
+      "build": "tsc",
+      "start": "node dist/index.js",
+      "dev": "ts-node src/index.ts",
+      "test": "jest"
+    },
+    "dependencies": {
+      "openai": "^4.0.0",
+      "axios": "^1.6.0",
+      "dotenv": "^16.3.1",
+      "readline-sync": "^1.4.10",
+      "chalk": "^4.1.2"
+    },
+    "devDependencies": {
+      "@types/node": "^20.0.0",
+      "@types/readline-sync": "^1.4.8",
+      "typescript": "^5.0.0",
+      "ts-node": "^10.9.0",
+      "jest": "^29.0.0",
+      "@types/jest": "^29.0.0"
+    }
+  }
+
+
+--------------------tsconfig.json-------------------------
+{
+    "compilerOptions": {
+      "target": "ES2022",
+      "module": "commonjs",
+      "lib": ["ES2022"],
+      "outDir": "./dist",
+      "rootDir": "./src",
+      "strict": true,
+      "esModuleInterop": true,
+      "skipLibCheck": true,
+      "forceConsistentCasingInFileNames": true,
+      "resolveJsonModule": true
+    },
+    "include": ["src/**/*"],
+    "exclude": ["node_modules", "dist"]
+  }
+  
+  
+  ------------------------src/agent/ai-agent.ts------------------
+import OpenAI from 'openai';
+import { MCPClient } from '../mcp/client';
+import { ConversationContext, MCPTool } from '../types';
+import {
+  ChatCompletionTool,
+  ChatCompletionMessageParam
+} from 'openai/resources';
+
+export class AIAgent {
+  private openai: OpenAI;
+  private mcpClient: MCPClient;
+  private context: ConversationContext;
+
+  constructor(apiKey: string, mcpClient: MCPClient) {
+    this.openai = new OpenAI({
+      apiKey
+      // Remove baseURL override for Gemini unless you’re using the official Gemini SDK
+    });
+    this.mcpClient = mcpClient;
+    this.context = {
+      history: [],
+      availableTools: [],
+      lastToolResults: {}
+    };
+  }
+
+  async initialize(): Promise<void> {
+    console.log('Initializing AI Agent...');
+
+    // Discover tools from MCP server
+    this.context.availableTools = await this.mcpClient.discoverTools();
+
+    // Add system message
+    this.context.history.push({
+      role: 'system',
+      content: this.buildSystemPrompt(),
+      timestamp: new Date()
+    });
+
+    console.log('✅ AI Agent initialized');
+  }
+
+  private buildSystemPrompt(): string {
+    const toolDescriptions = this.context.availableTools
+      .map(
+        (tool) =>
+          `- ${tool.name}: ${tool.description}\n  Parameters: ${JSON.stringify(
+            tool.inputSchema,
+            null,
+            2
+          )}`
+      )
+      .join('\n');
+
+    return `You are an AI assistant, using tools through an MCP (Model Context Protocol) server.
+
+Available tools:
+${toolDescriptions}
+
+Guidelines:
+1. Use the appropriate tool when needed.
+2. Extract parameters correctly.
+3. Validate all parameters before calling a tool.
+4. Explain actions and results clearly.
+5. Ask for clarification when unsure.
+6. Be helpful and conversational.`;
+  }
+
+  private createToolFunctions(): ChatCompletionTool[] {
+    return this.context.availableTools.map((tool) => ({
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.inputSchema
+      }
+    }));
+  }
+
+  async processUserInput(userInput: string): Promise<string> {
+    this.context.history.push({
+      role: 'user',
+      content: userInput,
+      timestamp: new Date()
+    });
+
+    try {
+      const messages: ChatCompletionMessageParam[] = this.context.history.map(
+        (msg) => ({
+          role: msg.role as 'system' | 'user' | 'assistant',
+          content: msg.content
+        })
+      );
+
+      // ✅ First call to model with tools
+      const response = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini', // Replace with your actual model
+        messages: messages,
+        tools: this.createToolFunctions(),
+        tool_choice: 'auto',
+        temperature: 0.7,
+        max_tokens: 1000
+      });
+
+      const assistantMessage = response.choices[0]?.message;
+      if (!assistantMessage) {
+        throw new Error('No response from model');
+      }
+
+      // ✅ Handle tool call
+      if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+        const toolCall = assistantMessage.tool_calls[0];
+        const functionName = toolCall.function.name;
+        const functionArgs = JSON.parse(toolCall.function.arguments || '{}');
+
+        console.log(
+          `AI is calling tool: ${functionName} with args:`,
+          functionArgs
+        );
+
+        try {
+          const toolResult = await this.mcpClient.callTool(
+            functionName,
+            functionArgs
+          );
+          this.context.lastToolResults[functionName] = toolResult;
+
+          // Second call to model with tool result
+          const followUpMessages: ChatCompletionMessageParam[] = [
+            ...messages,
+            {
+              role: 'assistant',
+              content: assistantMessage.content || '',
+              tool_calls: assistantMessage.tool_calls
+            },
+            {
+              role: 'tool',
+              tool_call_id: toolCall.id, // REQUIRED
+              content: JSON.stringify(toolResult)
+            }
+          ];
+
+          const finalResponse = await this.openai.chat.completions.create({
+            model: 'gpt-4o-mini', // Replace with your actual model
+            messages: followUpMessages,
+            temperature: 0.7,
+            max_tokens: 1000
+          });
+
+          const finalMessage =
+            finalResponse.choices[0]?.message?.content ||
+            'Tool executed successfully but no response generated.';
+
+          this.context.history.push({
+            role: 'assistant',
+            content: finalMessage,
+            timestamp: new Date()
+          });
+
+          return finalMessage;
+        } catch (toolError: any) {
+          const errorMessage = `I tried to use the ${functionName} tool, but encountered an error: ${toolError.message}`;
+          this.context.history.push({
+            role: 'assistant',
+            content: errorMessage,
+            timestamp: new Date()
+          });
+          return errorMessage;
+        }
+      }
+
+      // Regular conversation
+      const responseContent =
+        assistantMessage.content ||
+        'I apologize, but I could not generate a response.';
+      this.context.history.push({
+        role: 'assistant',
+        content: responseContent,
+        timestamp: new Date()
+      });
+
+      return responseContent;
+    } catch (error: any) {
+      const errorMessage = `I encountered an error: ${error.message}`;
+      this.context.history.push({
+        role: 'assistant',
+        content: errorMessage,
+        timestamp: new Date()
+      });
+      return errorMessage;
+    }
+  }
+
+  getConversationHistory(): ConversationContext {
+    return { ...this.context };
+  }
+
+  clearHistory(): void {
+    this.context.history = [
+      {
+        role: 'system',
+        content: this.buildSystemPrompt(),
+        timestamp: new Date()
+      }
+    ];
+    this.context.lastToolResults = {};
+  }
+}
+
+
+------------------src/auth/stytch-manager.ts--------------------
+import axios from 'axios';
+import { StytchConfig } from '../types';
+import readline from 'readline';
+
+export class StytchAuthManager {
+  private token: string | null = null;
+  private tokenExpiry: Date | null = null;
+  private config: StytchConfig;
+
+  constructor(config: StytchConfig) {
+    this.config = config;
+  }
+
+  private async promptForOTP(): Promise<string> {
+    return new Promise((resolve) => {
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+      rl.question(`Enter the OTP sent to ${this.config.email}: `, (code) => {
+        rl.close();
+        resolve(code.trim());
+      });
+    });
+  }
+
+  private getAuthHeader(): string {
+    const credentials = Buffer.from(`${this.config.projectId}:${this.config.secret}`).toString('base64');
+    return `Basic ${credentials}`;
+  }
+
+  private async findExistingUser(email: string): Promise<string> {
+    const response = await axios.post(
+      `${this.config.baseUrl}/users/search`,
+      {
+        query: {
+          operator: 'AND',
+          operands: [
+            {
+              filter_name: 'email_address',
+              filter_value: [email],
+            },
+          ],
+        },
+      },
+      {
+        headers: {
+          Authorization: this.getAuthHeader(),
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    if (response.data.results && response.data.results.length > 0) {
+      return response.data.results[0].user_id;
+    }
+
+    throw new Error('User not found');
+  }
+
+  async createSession(): Promise<string> {
+    try {
+      console.log(`Sending OTP to ${this.config.email}...`);
+
+      // Step 1: Send OTP
+      const otpSendRes = await axios.post(
+        `${this.config.baseUrl}/otps/email/login_or_create`,
+        {
+          email: this.config.email,
+        },
+        {
+          headers: {
+            Authorization: this.getAuthHeader(),
+            'Content-Type': 'application/json',
+          },
+        }
+      );
+
+      console.log('Full OTP Send Response:', JSON.stringify(otpSendRes.data, null, 2));
+
+      const methodId = otpSendRes.data.method_id || otpSendRes.data.email_id;
+      if (!methodId) {
+        throw new Error(`No method_id/email_id in OTP send response: ${JSON.stringify(otpSendRes.data)}`);
+      }
+
+      // Step 2: Get OTP
+      let otpCode: string;
+      if (otpSendRes.data.otp_code) {
+        // Test mode — Stytch returns OTP directly
+        console.log(`🧪 Test mode OTP received: ${otpSendRes.data.otp_code}`);
+        otpCode = otpSendRes.data.otp_code;
+      } else {
+        // Live mode — prompt user
+        otpCode = await this.promptForOTP();
+      }
+
+      // Step 3: Authenticate OTP
+      const otpAuthRes = await axios.post(
+        `${this.config.baseUrl}/otps/authenticate`,
+        {
+          method_id: methodId,
+          code: otpCode,
+          session_duration_minutes: 60,
+        },
+        {
+          headers: {
+            Authorization: this.getAuthHeader(),
+            'Content-Type': 'application/json',
+          },
+        }
+      );
+
+      console.log('OTP Auth Response:', otpAuthRes.data);
+
+      if (otpAuthRes.data.session_jwt) {
+        this.token = otpAuthRes.data.session_jwt;
+        this.tokenExpiry = new Date(Date.now() + 55 * 60 * 1000);
+        console.log('✅ Session created successfully');
+        return this.token as string;
+      }
+
+      throw new Error('No session JWT in OTP auth response');
+    } catch (error: any) {
+      if (error.response) {
+        console.error('Stytch API Error:', JSON.stringify(error.response.data, null, 2));
+      }
+      throw new Error(`Failed to create OTP session: ${error.message}`);
+    }
+  }
+
+  async getValidToken(): Promise<string> {
+    if (this.token && this.tokenExpiry && new Date() < this.tokenExpiry) {
+      return this.token;
+    }
+
+    console.log('Token expired or missing, creating new session...');
+    return await this.createSession();
+  }
+
+  async validateToken(token: string): Promise<boolean> {
+    try {
+      const response = await axios.post(
+        `${this.config.baseUrl}/sessions/authenticate`,
+        { session_jwt: token },
+        {
+          headers: {
+            Authorization: this.getAuthHeader(),
+            'Content-Type': 'application/json',
+          },
+        }
+      );
+      return response.status === 200;
+    } catch {
+      return false;
+    }
+  }
+}
+
+
+
+---------------------src/cli/interface.ts----------------------------
+
+// src/cli/interface.ts
+import readlineSync from 'readline-sync';
+import chalk from 'chalk';
+import { AIAgent } from '../agent/ai-agent';
+
+export class CLIInterface {
+  private agent: AIAgent;
+
+  constructor(agent: AIAgent) {
+    this.agent = agent;
+  }
+
+  async start(): Promise<void> {
+    console.log(chalk.blue.bold('\n🤖 MCP AI Agent - Interactive CLI'));
+    console.log(chalk.gray('Type "quit", "exit", or press Ctrl+C to exit'));
+    console.log(chalk.gray('Type "clear" to clear conversation history'));
+    console.log(chalk.gray('Type "help" for available commands\n'));
+
+    while (true) {
+      const userInput = readlineSync.question(chalk.green('You: '));
+
+      if (['quit', 'exit', 'q'].includes(userInput.toLowerCase())) {
+        console.log(chalk.yellow('Goodbye! 👋'));
+        break;
+      }
+
+      if (userInput.toLowerCase() === 'clear') {
+        this.agent.clearHistory();
+        console.log(chalk.yellow('Conversation history cleared.\n'));
+        continue;
+      }
+
+      if (userInput.toLowerCase() === 'help') {
+        this.showHelp();
+        continue;
+      }
+
+      if (userInput.trim() === '') {
+        continue;
+      }
+
+      try {
+        console.log(chalk.gray('🤔 Thinking...'));
+        const response = await this.agent.processUserInput(userInput);
+        console.log(chalk.blue('Agent: ') + response + '\n');
+      } catch (error: any) {
+        console.log(chalk.red(`Error: ${error.message}\n`));
+      }
+    }
+  }
+
+  private showHelp(): void {
+    console.log(chalk.cyan('\n📖 Available Commands:'));
+    console.log(chalk.gray('  help     - Show this help message'));
+    console.log(chalk.gray('  clear    - Clear conversation history'));
+    console.log(chalk.gray('  quit/exit - Exit the application'));
+    
+    console.log(chalk.cyan('\n🔧 Available Tools:'));
+    const tools = this.agent.getConversationHistory().availableTools;
+    tools.forEach(tool => {
+      console.log(chalk.gray(`  ${tool.name} - ${tool.description}`));
+    });
+    
+    console.log(chalk.cyan('\n💡 Example Queries:'));
+    console.log(chalk.gray('  "Add 15 and 27"'));
+    console.log(chalk.gray('  "What is 100 plus 200?"'));
+    console.log(chalk.gray('  "Can you add these numbers: 5 and 10?"'));
+    console.log('');
+  }
+}
+
+
+
+----------------------src/mcp/client.ts------------------
+import axios from 'axios';
+import { MCPConfig, MCPTool, MCPResponse } from '../types';
+
+export class MCPClient {
+  private config: MCPConfig;
+  private authToken: string | null = null;
+  private availableTools: MCPTool[] = [];
+  private requestId = 1;
+
+  constructor(config: MCPConfig) {
+    this.config = config;
+  }
+
+  setAuthToken(token: string) {
+    this.authToken = token;
+  }
+
+  private async makeRequest(method: string, params?: any): Promise<MCPResponse> {
+    if (!this.authToken) {
+      throw new Error('No authentication token available');
+    }
+
+    const requestData = {
+      jsonrpc: "2.0",
+      method,
+      params,
+      id: this.requestId++
+    };
+
+    try {
+      const response = await axios.post(`${this.config.serverUrl}/mcp`, requestData, {
+        headers: {
+          'Authorization': `Bearer ${this.authToken}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      });
+
+      return response.data;
+    } catch (error: any) {
+      if (error.response) {
+        throw new Error(`MCP Error: ${error.response.status} - ${error.response.data?.error?.message || 'Unknown error'}`);
+      }
+      throw new Error(`Network Error: ${error.message}`);
+    }
+  }
+
+  async initialize(): Promise<void> {
+    console.log('Initializing MCP connection...');
+    const response = await this.makeRequest('initialize');
+    
+    if (response.error) {
+      throw new Error(`MCP Initialize failed: ${response.error.message}`);
+    }
+
+    console.log('✅ MCP connection initialized');
+    console.log('Server info:', response.result?.serverInfo);
+  }
+
+  async discoverTools(): Promise<MCPTool[]> {
+    console.log('Discovering available tools...');
+    const response = await this.makeRequest('tools/list');
+    
+    if (response.error) {
+      throw new Error(`Tool discovery failed: ${response.error.message}`);
+    }
+
+    this.availableTools = response.result?.tools || [];
+    console.log(`✅ Found ${this.availableTools.length} tools:`, 
+                this.availableTools.map(t => t.name).join(', '));
+    
+    return this.availableTools;
+  }
+
+  async callTool(toolName: string, args: Record<string, any>): Promise<any> {
+    console.log(`Calling tool: ${toolName} with args:`, args);
+    
+    const response = await this.makeRequest('tools/call', {
+      name: toolName,
+      arguments: args
+    });
+
+    if (response.error) {
+      throw new Error(`Tool execution failed: ${response.error.message}`);
+    }
+
+    console.log('✅ Tool executed successfully');
+    return response.result;
+  }
+
+  getAvailableTools(): MCPTool[] {
+    return this.availableTools;
+  }
+
+  getToolSchema(toolName: string): MCPTool | null {
+    return this.availableTools.find(tool => tool.name === toolName) || null;
+  }
+}
+
+
+-------config.ts---------------
+// src/config.ts
+import dotenv from 'dotenv';
+import { AgentConfig } from './types';
+
+dotenv.config();
+
+export const config: AgentConfig = {
+  geminiApiKey: process.env.GEMINI_API_KEY || '', // Changed from openaiApiKey
+  stytch: {
+    projectId: process.env.STYTCH_PROJECT_ID || '',
+    secret: process.env.STYTCH_SECRET || '',
+    email: "varunverma823@gmail.com",
+    baseUrl: "https://test.stytch.com/v1"
+  },
+  mcp: {
+    serverUrl: process.env.MCP_SERVER_URL || 'http://localhost:8787',
+  },
+};
+
+if (!config.geminiApiKey) {
+  throw new Error('GEMINI_API_KEY is required');
+}
+
+if (!config.stytch.projectId || !config.stytch.secret) {
+  throw new Error('Stytch configuration is required');
+}
+
+
+
+--------------------index.ts----------------------
+
+// src/index.ts
+import { config } from './config';
+import { StytchAuthManager } from './auth/stytch-manager';
+import { MCPClient } from './mcp/client';
+import { AIAgent } from './agent/ai-agent';
+import { CLIInterface } from './cli/interface';
+
+async function main() {
+  try {
+    // Initialize Stytch Auth Manager
+    const authManager = new StytchAuthManager(config.stytch);
+    
+    // Get or create valid token
+    const token = await authManager.getValidToken();
+    
+    // Initialize MCP Client
+    const mcpClient = new MCPClient(config.mcp);
+    mcpClient.setAuthToken(token);
+    await mcpClient.initialize();
+    
+    // Initialize AI Agent
+    const aiAgent = new AIAgent(config.geminiApiKey, mcpClient);
+    await aiAgent.initialize();
+    
+    // Start CLI Interface
+    const cli = new CLIInterface(aiAgent);
+    await cli.start();
+    
+  } catch (error: any) {
+    console.error('❌ Fatal error:', error.message);
+    process.exit(1);
+  }
+}
+
+main().catch(console.error);
+
+
+-------------------types.ts---------------------------
+
+// src/types.ts
+export interface StytchConfig {
+    projectId: string;
+    secret: string;
+    email: string;
+    baseUrl: string;
+  }
+  
+  export interface MCPConfig {
+    serverUrl: string;
+  }
+  
+  export interface AgentConfig {
+    geminiApiKey: string;
+    stytch: StytchConfig;
+    mcp: MCPConfig;
+  }
+  
+  export interface MCPTool {
+    name: string;
+    description: string;
+    inputSchema: {
+      type: "object";
+      properties: Record<string, any>;
+      required?: string[];
+    };
+  }
+  
+  export interface MCPResponse {
+    jsonrpc: "2.0";
+    result?: any;
+    error?: {
+      code: number;
+      message: string;
+      data?: any;
+    };
+    id?: string | number;
+  }
+  
+  export interface ConversationContext {
+    history: Array<{
+      role: "user" | "assistant" | "system";
+      content: string;
+      timestamp: Date;
+    }>;
+    availableTools: MCPTool[];
+    lastToolResults: Record<string, any>;
+  }
